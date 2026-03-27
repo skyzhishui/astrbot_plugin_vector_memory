@@ -1,0 +1,30 @@
+{
+  "embedding_provider_id": {
+    "type": "string",
+    "description": "Embedding Provider ID (在 AstrBot 服务提供商配置中查看)",
+    "default": ""
+  },
+  "auto_remember": {
+    "type": "bool",
+    "description": "是否自动记住对话中的重要信息",
+    "default": true
+  },
+  "memory_threshold": {
+    "type": "int",
+    "description": "自动记忆的阈值(对话轮数)，超过此值自动提取记忆",
+    "default": 5
+  },
+  "top_k": {
+    "type": "int",
+    "description": "检索记忆时返回的最相关记忆数量",
+    "default": 5
+  },
+  "admin_ids": {
+    "type": "list",
+    "description": "管理员ID列表，只有管理员可以管理记忆",
+    "items": {
+      "type": "string"
+    },
+    "default": []
+  }
+}
