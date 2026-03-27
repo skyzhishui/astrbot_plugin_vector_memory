@@ -1,60 +1,51 @@
 """
 向量记忆存储模块
-使用 SQLite + JSON 实现轻量级向量存储
+使用 ChromaDB 实现向量存储
 """
 
-import json
-import sqlite3
 import asyncio
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-import numpy as np
 from astrbot.api import logger
+
+try:
+    import chromadb
+    from chromadb.config import Settings
+    CHROMA_AVAILABLE = True
+except ImportError:
+    CHROMA_AVAILABLE = False
+    logger.warning("ChromaDB 未安装，请运行: pip install chromadb")
 
 
 class VectorMemoryStore:
-    """向量记忆存储"""
+    """向量记忆存储 - ChromaDB 实现"""
     
     def __init__(self, db_path: str, embedding_dim: int = 1024):
+        if not CHROMA_AVAILABLE:
+            raise ImportError("ChromaDB 未安装，请运行: pip install chromadb")
+        
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.embedding_dim = embedding_dim
         self._lock = asyncio.Lock()
-        self._init_db()
-    
-    def _init_db(self):
-        """初始化数据库"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
         
-        # 记忆表
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS memories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                content TEXT NOT NULL,
-                embedding BLOB,
-                category TEXT DEFAULT 'general',
-                importance REAL DEFAULT 0.5,
-                source TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                access_count INTEGER DEFAULT 0
+        # 初始化 ChromaDB 客户端（本地持久化）
+        self.client = chromadb.PersistentClient(
+            path=str(self.db_path),
+            settings=Settings(
+                anonymized_telemetry=False,  # 禁用遥测
+                allow_reset=True
             )
-        ''')
+        )
         
-        # 创建向量相似度搜索的索引（使用内存中的numpy）
-        conn.commit()
-        conn.close()
-        logger.info(f"向量记忆数据库初始化完成: {self.db_path}")
-    
-    def _serialize_embedding(self, embedding: list[float]) -> bytes:
-        """序列化向量为bytes"""
-        return np.array(embedding, dtype=np.float32).tobytes()
-    
-    def _deserialize_embedding(self, data: bytes) -> np.ndarray:
-        """反序列化bytes为向量"""
-        return np.frombuffer(data, dtype=np.float32)
+        # 获取或创建集合
+        self.collection = self.client.get_or_create_collection(
+            name="memories",
+            metadata={"hnsw:space": "cosine"}  # 使用余弦相似度
+        )
+        
+        logger.info(f"ChromaDB 向量记忆存储初始化完成: {self.db_path}")
     
     async def add_memory(
         self,
@@ -67,19 +58,27 @@ class VectorMemoryStore:
         """添加记忆"""
         async with self._lock:
             def _add():
-                conn = sqlite3.connect(self.db_path)
-                cursor = conn.cursor()
+                # 生成唯一 ID（使用时间戳 + 随机数）
+                import time
+                import random
+                memory_id = int(time.time() * 1000000) + random.randint(0, 999)
+                
                 now = datetime.now().isoformat()
-                embedding_bytes = self._serialize_embedding(embedding)
                 
-                cursor.execute('''
-                    INSERT INTO memories (content, embedding, category, importance, source, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (content, embedding_bytes, category, importance, source, now, now))
+                self.collection.add(
+                    ids=[str(memory_id)],
+                    embeddings=[embedding],
+                    documents=[content],
+                    metadatas=[{
+                        "category": category,
+                        "importance": importance,
+                        "source": source or "",
+                        "created_at": now,
+                        "updated_at": now,
+                        "access_count": 0
+                    }]
+                )
                 
-                memory_id = cursor.lastrowid
-                conn.commit()
-                conn.close()
                 return memory_id
             
             return await asyncio.get_event_loop().run_in_executor(None, _add)
@@ -94,61 +93,51 @@ class VectorMemoryStore:
         """搜索相似记忆"""
         async with self._lock:
             def _search():
-                conn = sqlite3.connect(self.db_path)
-                cursor = conn.cursor()
+                # 构建过滤条件
+                where_filter = None
+                if category and min_importance > 0:
+                    where_filter = {
+                        "$and": [
+                            {"category": category},
+                            {"importance": {"$gte": min_importance}}
+                        ]
+                    }
+                elif category:
+                    where_filter = {"category": category}
+                elif min_importance > 0:
+                    where_filter = {"importance": {"$gte": min_importance}}
                 
-                # 构建查询
-                if category:
-                    cursor.execute('''
-                        SELECT id, content, embedding, category, importance, source, created_at, access_count
-                        FROM memories
-                        WHERE category = ? AND importance >= ?
-                        ORDER BY importance DESC
-                    ''', (category, min_importance))
-                else:
-                    cursor.execute('''
-                        SELECT id, content, embedding, category, importance, source, created_at, access_count
-                        FROM memories
-                        WHERE importance >= ?
-                        ORDER BY importance DESC
-                    ''', (min_importance,))
+                # 执行查询
+                results = self.collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=top_k,
+                    where=where_filter,
+                    include=["documents", "metadatas", "distances"]
+                )
                 
-                rows = cursor.fetchall()
-                conn.close()
-                
-                if not rows:
+                if not results["ids"] or not results["ids"][0]:
                     return []
                 
-                # 计算相似度
-                query_vec = np.array(query_embedding, dtype=np.float32)
-                query_norm = np.linalg.norm(query_vec)
-                
-                results = []
-                for row in rows:
-                    memory_id, content, embedding_bytes, cat, imp, source, created_at, access_count = row
-                    memory_vec = self._deserialize_embedding(embedding_bytes)
+                # 格式化结果
+                memories = []
+                for i, memory_id in enumerate(results["ids"][0]):
+                    metadata = results["metadatas"][0][i]
+                    # ChromaDB 返回的是距离，转换为相似度 (1 - distance for cosine)
+                    distance = results["distances"][0][i]
+                    similarity = 1.0 - distance  # 余弦距离转相似度
                     
-                    # 余弦相似度
-                    memory_norm = np.linalg.norm(memory_vec)
-                    if memory_norm > 0 and query_norm > 0:
-                        similarity = np.dot(query_vec, memory_vec) / (query_norm * memory_norm)
-                    else:
-                        similarity = 0.0
-                    
-                    results.append({
-                        "id": memory_id,
-                        "content": content,
-                        "category": cat,
-                        "importance": imp,
-                        "source": source,
-                        "created_at": created_at,
-                        "access_count": access_count,
+                    memories.append({
+                        "id": int(memory_id),
+                        "content": results["documents"][0][i],
+                        "category": metadata.get("category", "general"),
+                        "importance": metadata.get("importance", 0.5),
+                        "source": metadata.get("source", ""),
+                        "created_at": metadata.get("created_at", ""),
+                        "access_count": metadata.get("access_count", 0),
                         "similarity": float(similarity)
                     })
                 
-                # 按相似度排序并返回top_k
-                results.sort(key=lambda x: x["similarity"], reverse=True)
-                return results[:top_k]
+                return memories
             
             return await asyncio.get_event_loop().run_in_executor(None, _search)
     
@@ -156,35 +145,35 @@ class VectorMemoryStore:
         """获取所有记忆"""
         async with self._lock:
             def _get():
-                conn = sqlite3.connect(self.db_path)
-                cursor = conn.cursor()
+                # 构建过滤条件
+                where_filter = {"category": category} if category else None
                 
-                if category:
-                    cursor.execute('''
-                        SELECT id, content, category, importance, source, created_at, access_count
-                        FROM memories
-                        WHERE category = ?
-                        ORDER BY created_at DESC
-                    ''', (category,))
-                else:
-                    cursor.execute('''
-                        SELECT id, content, category, importance, source, created_at, access_count
-                        FROM memories
-                        ORDER BY created_at DESC
-                    ''')
+                # 获取所有记录
+                results = self.collection.get(
+                    where=where_filter,
+                    include=["documents", "metadatas"]
+                )
                 
-                rows = cursor.fetchall()
-                conn.close()
+                if not results["ids"]:
+                    return []
                 
-                return [{
-                    "id": row[0],
-                    "content": row[1],
-                    "category": row[2],
-                    "importance": row[3],
-                    "source": row[4],
-                    "created_at": row[5],
-                    "access_count": row[6]
-                } for row in rows]
+                # 格式化结果
+                memories = []
+                for i, memory_id in enumerate(results["ids"]):
+                    metadata = results["metadatas"][i]
+                    memories.append({
+                        "id": int(memory_id),
+                        "content": results["documents"][i],
+                        "category": metadata.get("category", "general"),
+                        "importance": metadata.get("importance", 0.5),
+                        "source": metadata.get("source", ""),
+                        "created_at": metadata.get("created_at", ""),
+                        "access_count": metadata.get("access_count", 0)
+                    })
+                
+                # 按创建时间倒序排列
+                memories.sort(key=lambda x: x["created_at"], reverse=True)
+                return memories
             
             return await asyncio.get_event_loop().run_in_executor(None, _get)
     
@@ -192,13 +181,11 @@ class VectorMemoryStore:
         """删除记忆"""
         async with self._lock:
             def _delete():
-                conn = sqlite3.connect(self.db_path)
-                cursor = conn.cursor()
-                cursor.execute('DELETE FROM memories WHERE id = ?', (memory_id,))
-                deleted = cursor.rowcount > 0
-                conn.commit()
-                conn.close()
-                return deleted
+                try:
+                    self.collection.delete(ids=[str(memory_id)])
+                    return True
+                except Exception:
+                    return False
             
             return await asyncio.get_event_loop().run_in_executor(None, _delete)
     
@@ -206,17 +193,32 @@ class VectorMemoryStore:
         """更新记忆重要性"""
         async with self._lock:
             def _update():
-                conn = sqlite3.connect(self.db_path)
-                cursor = conn.cursor()
-                now = datetime.now().isoformat()
-                cursor.execute('''
-                    UPDATE memories SET importance = ?, updated_at = ?
-                    WHERE id = ?
-                ''', (importance, now, memory_id))
-                updated = cursor.rowcount > 0
-                conn.commit()
-                conn.close()
-                return updated
+                try:
+                    # ChromaDB 需要先获取再更新
+                    result = self.collection.get(
+                        ids=[str(memory_id)],
+                        include=["documents", "embeddings", "metadatas"]
+                    )
+                    
+                    if not result["ids"]:
+                        return False
+                    
+                    # 更新 metadata
+                    metadata = result["metadatas"][0]
+                    metadata["importance"] = importance
+                    metadata["updated_at"] = datetime.now().isoformat()
+                    
+                    # 重新 upsert
+                    self.collection.upsert(
+                        ids=[str(memory_id)],
+                        embeddings=[result["embeddings"][0]],
+                        documents=[result["documents"][0]],
+                        metadatas=[metadata]
+                    )
+                    return True
+                except Exception as e:
+                    logger.error(f"更新记忆重要性失败: {e}")
+                    return False
             
             return await asyncio.get_event_loop().run_in_executor(None, _update)
     
@@ -224,14 +226,26 @@ class VectorMemoryStore:
         """增加访问计数"""
         async with self._lock:
             def _increment():
-                conn = sqlite3.connect(self.db_path)
-                cursor = conn.cursor()
-                cursor.execute('''
-                    UPDATE memories SET access_count = access_count + 1
-                    WHERE id = ?
-                ''', (memory_id,))
-                conn.commit()
-                conn.close()
+                try:
+                    result = self.collection.get(
+                        ids=[str(memory_id)],
+                        include=["documents", "embeddings", "metadatas"]
+                    )
+                    
+                    if not result["ids"]:
+                        return
+                    
+                    metadata = result["metadatas"][0]
+                    metadata["access_count"] = metadata.get("access_count", 0) + 1
+                    
+                    self.collection.upsert(
+                        ids=[str(memory_id)],
+                        embeddings=[result["embeddings"][0]],
+                        documents=[result["documents"][0]],
+                        metadatas=[metadata]
+                    )
+                except Exception as e:
+                    logger.error(f"更新访问计数失败: {e}")
             
             await asyncio.get_event_loop().run_in_executor(None, _increment)
     
@@ -239,21 +253,25 @@ class VectorMemoryStore:
         """获取记忆统计"""
         async with self._lock:
             def _stats():
-                conn = sqlite3.connect(self.db_path)
-                cursor = conn.cursor()
+                # 获取总数
+                count = self.collection.count()
                 
-                cursor.execute('SELECT COUNT(*) FROM memories')
-                total = cursor.fetchone()[0]
+                # 获取所有记录以统计分类
+                results = self.collection.get(include=["metadatas"])
                 
-                cursor.execute('SELECT category, COUNT(*) FROM memories GROUP BY category')
-                by_category = dict(cursor.fetchall())
+                by_category = {}
+                total_importance = 0.0
                 
-                cursor.execute('SELECT AVG(importance) FROM memories')
-                avg_importance = cursor.fetchone()[0] or 0
+                if results["metadatas"]:
+                    for metadata in results["metadatas"]:
+                        cat = metadata.get("category", "general")
+                        by_category[cat] = by_category.get(cat, 0) + 1
+                        total_importance += metadata.get("importance", 0.5)
                 
-                conn.close()
+                avg_importance = total_importance / count if count > 0 else 0
+                
                 return {
-                    "total_memories": total,
+                    "total_memories": count,
                     "by_category": by_category,
                     "avg_importance": avg_importance
                 }

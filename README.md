@@ -9,12 +9,14 @@
 - 🎯 **智能注入**: 在对话时自动检索相关记忆并注入上下文
 - 📊 **分类管理**: 支持多种记忆类别（偏好、事实、事件等）
 - ⭐ **重要性评分**: 每条记忆都有重要性权重
+- 🚀 **ChromaDB 驱动**: 使用 ChromaDB 实现高效的向量索引和检索
 
 ## 📦 安装
 
 1. 将插件放入 `AstrBot/data/plugins/astrbot_plugin_vector_memory/` 目录
-2. 在 AstrBot 管理面板中配置 Embedding Provider ID
-3. 重启 AstrBot 或使用 `/memory_init` 初始化
+2. 安装依赖: `pip install chromadb`
+3. 在 AstrBot 管理面板中配置 Embedding Provider ID
+4. 重启 AstrBot 或使用 `/memory_init` 初始化
 
 ## ⚙️ 配置说明
 
@@ -64,15 +66,22 @@ AI: 找到 2 条相关记忆:
 
 ## 📁 数据存储
 
-记忆数据存储在 `/AstrBot/data/vector_memory/memories.db`（SQLite 数据库）
+记忆数据存储在 `/AstrBot/data/vector_memory/` 目录（ChromaDB 持久化存储）
 
 ## 🔧 技术架构
 
 ```
-用户消息 → Embedding → 向量相似度搜索 → 返回相关记忆
+用户消息 → Embedding → ChromaDB 向量搜索 → 返回相关记忆
                                     ↓
                               注入到 LLM 上下文
 ```
+
+### 为什么选择 ChromaDB？
+
+- ✅ **无需额外部署** - 嵌入式运行，像 SQLite 一样简单
+- ✅ **自动向量索引** - 使用 HNSW 算法，检索速度快
+- ✅ **支持元数据过滤** - 可按类别、重要性等条件筛选
+- ✅ **Python 原生** - API 简洁，易于集成
 
 ## 📝 记忆类别
 
