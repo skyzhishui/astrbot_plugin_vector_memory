@@ -28,7 +28,7 @@ MEMORY_RETRIEVAL_PROMPT = """以下是与你相关的长期记忆，请在回答
 @register(
     name="vector_memory",
     desc="向量化长期记忆系统，支持语义检索的主动记忆",
-    version="1.2.0",
+    version="1.2.1",
     author="Neko"
 )
 class VectorMemoryPlugin(Star):
@@ -227,7 +227,7 @@ class VectorMemoryPlugin(Star):
         
         Args:
             content(string): 要记住的内容
-            category(string): 记忆类别: preference(偏好), fact(事实), personal(个人信息), event(事件), task(任务), general(通用)
+            category(string): 记忆类别: preference(偏好), fact(事实), personal(个人信息), event(事件), task(任务), general(通用), secret(秘密)
             importance(number): 重要性 0.0-1.0，默认0.5
             visibility(string): 可见性: public(公共)/private(用户专属)/secret(秘密)，默认private
         """
@@ -274,7 +274,12 @@ class VectorMemoryPlugin(Star):
             result = f"找到 {len(memories)} 条相关记忆:\n\n"
             for i, m in enumerate(memories, 1):
                 result += f"{i}. [{m['category']}] {m['content']}\n"
-                result += f"   相关度: {m['similarity']:.2f} | 重要性: {m['importance']:.2f} | 可见性: {m['visibility']}\n\n"
+                result += f"   相关度: {m['similarity']:.2f} | 重要性: {m['importance']:.2f} | 可见性: {m['visibility']}\n"
+                # 显示所有者信息
+                owner = m.get('owner', '')
+                if owner:
+                    result += f"   所有者: {owner}\n"
+                result += "\n"
             
             return result
         except Exception as e:
@@ -285,7 +290,7 @@ class VectorMemoryPlugin(Star):
         """列出所有记忆
         
         Args:
-            category(string): 可选，按类别筛选: preference, fact, personal, event, task, general
+            category(string): 可选，按类别筛选: preference, fact, personal, event, task, general, secret
             visibility(string): 可选，按可见性筛选: public/private/secret
         """
         if not self.memory_store:
@@ -304,7 +309,10 @@ class VectorMemoryPlugin(Star):
             result = f"共有 {len(memories)} 条记忆:\n\n"
             for i, m in enumerate(memories, 1):
                 result += f"{i}. [ID:{m['id']}] [{m['category']}] [{m['visibility']}] {m['content']}\n"
-                result += f"   重要性: {m['importance']:.2f} | 访问: {m['access_count']}次\n\n"
+                # 显示所有者信息 - 修复：使用 is not None 和非空字符串判断
+                owner = m.get('owner', '')
+                owner_info = f"所有者: {owner}" if owner else "所有者: 未设置"
+                result += f"   重要性: {m['importance']:.2f} | 访问: {m['access_count']}次 | {owner_info}\n\n"
             
             return result
         except Exception as e:
@@ -393,7 +401,7 @@ class VectorMemoryPlugin(Star):
             result = f"✓ 记忆系统测试成功!\n"
             result += f"- 存储测试: ID {memory_id}\n"
             result += f"- 检索测试: 找到 {len(memories)} 条记忆\n"
-            result += f"- Embedding维度: {len(embedding)}"
+            result += f"- Embedding维度: {len(embedding)}\n"
             result += f"- 用户身份: {self.memory_store.get_canonical_user_id(event.get_sender_id())} {'(主人)' if self.memory_store.is_master(event.get_sender_id()) else ''}"
             
             yield event.plain_result(result)
