@@ -1,12 +1,13 @@
 """
 向量记忆存储模块
 使用 ChromaDB 实现向量存储
+支持：公共记忆、用户专属记忆、秘密记忆
 """
 
 import asyncio
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List
 from astrbot.api import logger
 
 try:
@@ -19,9 +20,21 @@ except ImportError:
 
 
 class VectorMemoryStore:
-    """向量记忆存储 - ChromaDB 实现"""
+    """向量记忆存储 - ChromaDB 实现
     
-    def __init__(self, db_path: str, embedding_dim: int = 1024):
+    记忆类型 (visibility):
+    - public: 公共记忆，所有用户可见（如主人的家庭成员、基本设定）
+    - private: 用户专属记忆，仅该用户可见
+    - secret: 秘密记忆，仅特定用户触发时可见
+    """
+    
+    def __init__(
+        self, 
+        db_path: str, 
+        embedding_dim: int = 1024,
+        user_identity_map: Dict[str, str] = None,
+        masters: List[str] = None
+    ):
         if not CHROMA_AVAILABLE:
             raise ImportError("ChromaDB 未安装，请运行: pip install chromadb")
         
@@ -30,11 +43,18 @@ class VectorMemoryStore:
         self.embedding_dim = embedding_dim
         self._lock = asyncio.Lock()
         
+        # 身份映射：多个 session_id 关联到同一个用户
+        # 格式: {"session_id": "canonical_user_id"}
+        self.user_identity_map = user_identity_map or {}
+        
+        # 主人列表（拥有最高权限）
+        self.masters = masters or []
+        
         # 初始化 ChromaDB 客户端（本地持久化）
         self.client = chromadb.PersistentClient(
             path=str(self.db_path),
             settings=Settings(
-                anonymized_telemetry=False,  # 禁用遥测
+                anonymized_telemetry=False,
                 allow_reset=True
             )
         )
@@ -42,10 +62,20 @@ class VectorMemoryStore:
         # 获取或创建集合
         self.collection = self.client.get_or_create_collection(
             name="memories",
-            metadata={"hnsw:space": "cosine"}  # 使用余弦相似度
+            metadata={"hnsw:space": "cosine"}
         )
         
         logger.info(f"ChromaDB 向量记忆存储初始化完成: {self.db_path}")
+        logger.info(f"加载身份映射: {len(self.user_identity_map)} 条，主人列表: {self.masters}")
+    
+    def get_canonical_user_id(self, session_id: str) -> str:
+        """获取用户的规范ID（处理多身份关联）"""
+        return self.user_identity_map.get(session_id, session_id)
+    
+    def is_master(self, session_id: str) -> bool:
+        """检查是否为主人"""
+        canonical_id = self.get_canonical_user_id(session_id)
+        return canonical_id in self.masters
     
     async def add_memory(
         self,
@@ -53,17 +83,38 @@ class VectorMemoryStore:
         embedding: list[float],
         category: str = "general",
         importance: float = 0.5,
-        source: Optional[str] = None
+        source: Optional[str] = None,
+        visibility: str = "public",
+        owner: Optional[str] = None,
+        allowed_users: Optional[list[str]] = None
     ) -> int:
-        """添加记忆"""
+        """添加记忆
+        
+        Args:
+            content: 记忆内容
+            embedding: 向量
+            category: 类别
+            importance: 重要性
+            source: 来源
+            visibility: 可见性 (public/private/secret)
+            owner: 所有者（用户ID）
+            allowed_users: 允许访问的用户列表（用于秘密记忆）
+        """
         async with self._lock:
             def _add():
-                # 生成唯一 ID（使用时间戳 + 随机数）
                 import time
                 import random
                 memory_id = int(time.time() * 1000000) + random.randint(0, 999)
                 
                 now = datetime.now().isoformat()
+                
+                # 处理 owner 的规范ID
+                canonical_owner = self.get_canonical_user_id(owner) if owner else None
+                
+                # 处理 allowed_users 的规范ID
+                canonical_allowed = None
+                if allowed_users:
+                    canonical_allowed = [self.get_canonical_user_id(u) for u in allowed_users]
                 
                 self.collection.add(
                     ids=[str(memory_id)],
@@ -75,7 +126,10 @@ class VectorMemoryStore:
                         "source": source or "",
                         "created_at": now,
                         "updated_at": now,
-                        "access_count": 0
+                        "access_count": 0,
+                        "visibility": visibility,
+                        "owner": canonical_owner or "",
+                        "allowed_users": ",".join(canonical_allowed) if canonical_allowed else ""
                     }]
                 )
                 
@@ -86,45 +140,70 @@ class VectorMemoryStore:
     async def search_similar(
         self,
         query_embedding: list[float],
+        user_id: str,
         top_k: int = 5,
         category: Optional[str] = None,
         min_importance: float = 0.0
     ) -> list[dict]:
-        """搜索相似记忆"""
+        """搜索相似记忆（根据用户权限过滤）
+        
+        Args:
+            query_embedding: 查询向量
+            user_id: 当前用户ID
+            top_k: 返回数量
+            category: 类别过滤
+            min_importance: 最小重要性
+        """
         async with self._lock:
             def _search():
-                # 构建过滤条件
-                where_filter = None
-                if category and min_importance > 0:
-                    where_filter = {
-                        "$and": [
-                            {"category": category},
-                            {"importance": {"$gte": min_importance}}
-                        ]
-                    }
-                elif category:
-                    where_filter = {"category": category}
-                elif min_importance > 0:
-                    where_filter = {"importance": {"$gte": min_importance}}
+                canonical_user = self.get_canonical_user_id(user_id)
+                is_master = self.is_master(user_id)
                 
-                # 执行查询
+                # 获取更多结果，然后手动过滤权限
                 results = self.collection.query(
                     query_embeddings=[query_embedding],
-                    n_results=top_k,
-                    where=where_filter,
+                    n_results=top_k * 3,  # 获取更多以便过滤
                     include=["documents", "metadatas", "distances"]
                 )
                 
                 if not results["ids"] or not results["ids"][0]:
                     return []
                 
-                # 格式化结果
+                # 格式化并过滤结果
                 memories = []
                 for i, memory_id in enumerate(results["ids"][0]):
                     metadata = results["metadatas"][0][i]
-                    # ChromaDB 返回的是距离，转换为相似度 (1 - distance for cosine)
+                    
+                    # 权限检查
+                    visibility = metadata.get("visibility", "public")
+                    owner = metadata.get("owner", "")
+                    allowed_users = metadata.get("allowed_users", "")
+                    
+                    # 主人可以看到所有记忆
+                    if is_master:
+                        pass
+                    # 公共记忆：所有人可见
+                    elif visibility == "public":
+                        pass
+                    # 私有记忆：只有所有者可见
+                    elif visibility == "private":
+                        if owner != canonical_user:
+                            continue
+                    # 秘密记忆：只有允许的用户可见
+                    elif visibility == "secret":
+                        if allowed_users and canonical_user not in allowed_users.split(","):
+                            continue
+                    else:
+                        continue
+                    
+                    # 类别和重要性过滤
+                    if category and metadata.get("category") != category:
+                        continue
+                    if metadata.get("importance", 0.5) < min_importance:
+                        continue
+                    
                     distance = results["distances"][0][i]
-                    similarity = 1.0 - distance  # 余弦距离转相似度
+                    similarity = 1.0 - distance
                     
                     memories.append({
                         "id": int(memory_id),
@@ -134,33 +213,65 @@ class VectorMemoryStore:
                         "source": metadata.get("source", ""),
                         "created_at": metadata.get("created_at", ""),
                         "access_count": metadata.get("access_count", 0),
+                        "visibility": visibility,
+                        "owner": owner,
                         "similarity": float(similarity)
                     })
+                    
+                    if len(memories) >= top_k:
+                        break
                 
                 return memories
             
             return await asyncio.get_event_loop().run_in_executor(None, _search)
     
-    async def get_all_memories(self, category: Optional[str] = None) -> list[dict]:
-        """获取所有记忆"""
+    async def get_all_memories(
+        self,
+        user_id: str,
+        category: Optional[str] = None,
+        visibility: Optional[str] = None
+    ) -> list[dict]:
+        """获取所有记忆（根据用户权限过滤）"""
         async with self._lock:
             def _get():
-                # 构建过滤条件
-                where_filter = {"category": category} if category else None
+                canonical_user = self.get_canonical_user_id(user_id)
+                is_master = self.is_master(user_id)
                 
-                # 获取所有记录
-                results = self.collection.get(
-                    where=where_filter,
-                    include=["documents", "metadatas"]
-                )
+                results = self.collection.get(include=["documents", "metadatas"])
                 
                 if not results["ids"]:
                     return []
                 
-                # 格式化结果
                 memories = []
                 for i, memory_id in enumerate(results["ids"]):
                     metadata = results["metadatas"][i]
+                    
+                    # 权限检查
+                    mem_visibility = metadata.get("visibility", "public")
+                    owner = metadata.get("owner", "")
+                    allowed_users = metadata.get("allowed_users", "")
+                    
+                    if is_master:
+                        pass
+                    elif mem_visibility == "public":
+                        pass
+                    elif mem_visibility == "private":
+                        if owner != canonical_user:
+                            continue
+                    elif mem_visibility == "secret":
+                        if allowed_users and canonical_user not in allowed_users.split(","):
+                            continue
+                    else:
+                        continue
+                    
+                    # 类别过滤
+                    if category and metadata.get("category") != category:
+                        continue
+                    
+                    # 可见性过滤
+                    if visibility and mem_visibility != visibility:
+                        continue
+                    
                     memories.append({
                         "id": int(memory_id),
                         "content": results["documents"][i],
@@ -168,23 +279,49 @@ class VectorMemoryStore:
                         "importance": metadata.get("importance", 0.5),
                         "source": metadata.get("source", ""),
                         "created_at": metadata.get("created_at", ""),
-                        "access_count": metadata.get("access_count", 0)
+                        "access_count": metadata.get("access_count", 0),
+                        "visibility": mem_visibility,
+                        "owner": owner
                     })
                 
-                # 按创建时间倒序排列
                 memories.sort(key=lambda x: x["created_at"], reverse=True)
                 return memories
             
             return await asyncio.get_event_loop().run_in_executor(None, _get)
     
-    async def delete_memory(self, memory_id: int) -> bool:
-        """删除记忆"""
+    async def delete_memory(self, memory_id: int, user_id: str) -> bool:
+        """删除记忆（需要权限）"""
         async with self._lock:
             def _delete():
                 try:
+                    # 先检查权限
+                    result = self.collection.get(
+                        ids=[str(memory_id)],
+                        include=["metadatas"]
+                    )
+                    
+                    if not result["ids"]:
+                        return False
+                    
+                    metadata = result["metadatas"][0]
+                    owner = metadata.get("owner", "")
+                    visibility = metadata.get("visibility", "public")
+                    canonical_user = self.get_canonical_user_id(user_id)
+                    
+                    # 主人可以删除任何记忆
+                    if self.is_master(user_id):
+                        pass
+                    # 公共记忆只有主人可以删除
+                    elif visibility == "public":
+                        return False
+                    # 私有/秘密记忆只有所有者可以删除
+                    elif owner != canonical_user:
+                        return False
+                    
                     self.collection.delete(ids=[str(memory_id)])
                     return True
-                except Exception:
+                except Exception as e:
+                    logger.error(f"删除记忆失败: {e}")
                     return False
             
             return await asyncio.get_event_loop().run_in_executor(None, _delete)
@@ -194,7 +331,6 @@ class VectorMemoryStore:
         async with self._lock:
             def _update():
                 try:
-                    # ChromaDB 需要先获取再更新
                     result = self.collection.get(
                         ids=[str(memory_id)],
                         include=["documents", "embeddings", "metadatas"]
@@ -203,12 +339,10 @@ class VectorMemoryStore:
                     if not result["ids"]:
                         return False
                     
-                    # 更新 metadata
                     metadata = result["metadatas"][0]
                     metadata["importance"] = importance
                     metadata["updated_at"] = datetime.now().isoformat()
                     
-                    # 重新 upsert
                     self.collection.upsert(
                         ids=[str(memory_id)],
                         embeddings=[result["embeddings"][0]],
@@ -249,23 +383,44 @@ class VectorMemoryStore:
             
             await asyncio.get_event_loop().run_in_executor(None, _increment)
     
-    async def get_stats(self) -> dict:
-        """获取记忆统计"""
+    async def get_stats(self, user_id: str) -> dict:
+        """获取记忆统计（根据用户权限）"""
         async with self._lock:
             def _stats():
-                # 获取总数
-                count = self.collection.count()
+                canonical_user = self.get_canonical_user_id(user_id)
+                is_master = self.is_master(user_id)
                 
-                # 获取所有记录以统计分类
                 results = self.collection.get(include=["metadatas"])
                 
                 by_category = {}
+                by_visibility = {"public": 0, "private": 0, "secret": 0}
                 total_importance = 0.0
+                count = 0
                 
                 if results["metadatas"]:
                     for metadata in results["metadatas"]:
+                        # 权限检查
+                        visibility = metadata.get("visibility", "public")
+                        owner = metadata.get("owner", "")
+                        allowed_users = metadata.get("allowed_users", "")
+                        
+                        if is_master:
+                            pass
+                        elif visibility == "public":
+                            pass
+                        elif visibility == "private":
+                            if owner != canonical_user:
+                                continue
+                        elif visibility == "secret":
+                            if allowed_users and canonical_user not in allowed_users.split(","):
+                                continue
+                        else:
+                            continue
+                        
+                        count += 1
                         cat = metadata.get("category", "general")
                         by_category[cat] = by_category.get(cat, 0) + 1
+                        by_visibility[visibility] = by_visibility.get(visibility, 0) + 1
                         total_importance += metadata.get("importance", 0.5)
                 
                 avg_importance = total_importance / count if count > 0 else 0
@@ -273,7 +428,10 @@ class VectorMemoryStore:
                 return {
                     "total_memories": count,
                     "by_category": by_category,
-                    "avg_importance": avg_importance
+                    "by_visibility": by_visibility,
+                    "avg_importance": avg_importance,
+                    "user_id": canonical_user,
+                    "is_master": is_master
                 }
             
             return await asyncio.get_event_loop().run_in_executor(None, _stats)

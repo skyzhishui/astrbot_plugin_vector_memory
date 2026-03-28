@@ -9,6 +9,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api import AstrBotConfig, logger
 from astrbot.core.provider.provider import EmbeddingProvider
+from astrbot.api.provider import ProviderRequest
 
 from .memory_store import VectorMemoryStore
 from .memory_extractor import MemoryExtractor
@@ -43,6 +44,11 @@ class VectorMemoryPlugin(Star):
         self.memory_threshold = config.get("memory_threshold", 5)
         self.top_k = config.get("top_k", 5)
         self.admin_ids = set(config.get("admin_ids", []))
+        self.user_identity_map_list = config.get("user_identity_map", [])
+        self.masters = config.get("masters", [])
+        
+        # 解析身份映射
+        self.user_identity_map = self._parse_identity_map(self.user_identity_map_list)
         
         # 初始化组件
         self.memory_store: VectorMemoryStore = None
@@ -52,10 +58,32 @@ class VectorMemoryPlugin(Star):
         # 对话计数器（用于自动记忆）
         self._conversation_counts: dict[str, int] = {}
         
-        # 记忆数据库路径
-        self.db_path = Path("/AstrBot/data/vector_memory/memories.db")
+        # 记忆数据库路径 - 修复：使用目录路径而不是文件路径
+        self.db_path = Path("/AstrBot/data/vector_memory/chroma_db")
         
         logger.info("向量记忆插件初始化中...")
+        logger.info(f"解析到身份映射: {self.user_identity_map}")
+        logger.info(f"主人列表: {self.masters}")
+    
+    def _parse_identity_map(self, map_list: list) -> dict:
+        """解析身份映射配置列表
+        每个元素格式: "userid=sid1,sid2"
+        """
+        identity_map = {}
+        if not map_list:
+            return identity_map
+        
+        for line in map_list:
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+            canonical_id, sids_part = line.split("=", 1)
+            canonical_id = canonical_id.strip()
+            sids = [s.strip() for s in sids_part.split(",") if s.strip()]
+            for sid in sids:
+                identity_map[sid] = canonical_id
+        
+        return identity_map
     
     async def initialize(self):
         """插件激活时调用"""
@@ -79,7 +107,9 @@ class VectorMemoryPlugin(Star):
             embedding_dim = self.embedding_provider.get_dim()
             self.memory_store = VectorMemoryStore(
                 db_path=str(self.db_path),
-                embedding_dim=embedding_dim
+                embedding_dim=embedding_dim,
+                user_identity_map=self.user_identity_map,
+                masters=self.masters
             )
             
             # 初始化记忆提取器
@@ -89,6 +119,8 @@ class VectorMemoryPlugin(Star):
             
         except Exception as e:
             logger.error(f"向量记忆插件初始化失败: {e}")
+            import traceback
+            traceback.print_exc()
     
     def is_admin(self, user_id: str) -> bool:
         """检查是否为管理员"""
@@ -103,7 +135,7 @@ class VectorMemoryPlugin(Star):
         return await self.embedding_provider.get_embedding(text)
     
     @filter.on_llm_request()
-    async def on_llm_request(self, event: AstrMessageEvent):
+    async def on_llm_request(self, event: AstrMessageEvent, request: ProviderRequest):
         """LLM请求前处理 - 自动检索相关记忆并注入"""
         if not self.memory_store:
             return
@@ -111,6 +143,7 @@ class VectorMemoryPlugin(Star):
         try:
             # 获取用户消息
             user_message = event.message_str
+            user_id = event.get_sender_id()
             if not user_message or len(user_message) < 3:
                 return
             
@@ -118,6 +151,7 @@ class VectorMemoryPlugin(Star):
             query_embedding = await self.get_embedding(user_message)
             memories = await self.memory_store.search_similar(
                 query_embedding=query_embedding,
+                user_id=user_id,
                 top_k=self.top_k
             )
             
@@ -132,8 +166,12 @@ class VectorMemoryPlugin(Star):
                 memory_context = "\n".join(memory_texts)
                 logger.info(f"检索到 {len(memories)} 条相关记忆")
                 
-                # 将记忆信息存储到事件额外数据中，供后续使用
-                event.set_extra("vector_memory_context", memory_context)
+                # 将记忆信息注入到系统提示词
+                memory_prompt = MEMORY_RETRIEVAL_PROMPT.format(memories=memory_context)
+                if request.system_prompt:
+                    request.system_prompt += "\n\n" + memory_prompt
+                else:
+                    request.system_prompt = memory_prompt
             
             # 更新对话计数
             session_id = event.unified_msg_origin
@@ -177,7 +215,8 @@ class VectorMemoryPlugin(Star):
                                 embedding=embedding,
                                 category=mem.get("category", "general"),
                                 importance=mem.get("importance", 0.5),
-                                source=f"session:{session_id}"
+                                source=f"session:{session_id}",
+                                owner=event.get_sender_id()
                             )
                         
                         # 重置计数器
@@ -190,13 +229,14 @@ class VectorMemoryPlugin(Star):
     # ============ LLM 工具 ============
     
     @filter.llm_tool(name="remember")
-    async def tool_remember(self, event: AstrMessageEvent, content: str, category: str = "general", importance: float = 0.5) -> str:
+    async def tool_remember(self, event: AstrMessageEvent, content: str, category: str = "general", importance: float = 0.5, visibility: str = "private") -> str:
         """主动记住一条信息
         
         Args:
             content(string): 要记住的内容
             category(string): 记忆类别: preference(偏好), fact(事实), personal(个人信息), event(事件), task(任务), general(通用)
             importance(number): 重要性 0.0-1.0，默认0.5
+            visibility(string): 可见性: public(公共)/private(用户专属)/secret(秘密)，默认private
         """
         if not self.memory_store:
             return "❌ 记忆系统未初始化"
@@ -208,9 +248,11 @@ class VectorMemoryPlugin(Star):
                 embedding=embedding,
                 category=category,
                 importance=importance,
-                source=f"user:{event.get_sender_id()}"
+                source=f"user:{event.get_sender_id()}",
+                visibility=visibility,
+                owner=event.get_sender_id()
             )
-            return f"✓ 已记住: {content} (ID: {memory_id}, 类别: {category})"
+            return f"✓ 已记住: {content} (ID: {memory_id}, 类别: {category}, 可见性: {visibility})"
         except Exception as e:
             return f"❌ 记忆存储失败: {e}"
     
@@ -229,6 +271,7 @@ class VectorMemoryPlugin(Star):
             embedding = await self.get_embedding(query)
             memories = await self.memory_store.search_similar(
                 query_embedding=embedding,
+                user_id=event.get_sender_id(),
                 top_k=top_k
             )
             
@@ -238,31 +281,36 @@ class VectorMemoryPlugin(Star):
             result = f"找到 {len(memories)} 条相关记忆:\n\n"
             for i, m in enumerate(memories, 1):
                 result += f"{i}. [{m['category']}] {m['content']}\n"
-                result += f"   相关度: {m['similarity']:.2f} | 重要性: {m['importance']:.2f}\n\n"
+                result += f"   相关度: {m['similarity']:.2f} | 重要性: {m['importance']:.2f} | 可见性: {m['visibility']}\n\n"
             
             return result
         except Exception as e:
             return f"❌ 记忆检索失败: {e}"
     
     @filter.llm_tool(name="list_memories")
-    async def tool_list_memories(self, event: AstrMessageEvent, category: str = None) -> str:
+    async def tool_list_memories(self, event: AstrMessageEvent, category: str = None, visibility: str = None) -> str:
         """列出所有记忆
         
         Args:
             category(string): 可选，按类别筛选: preference, fact, personal, event, task, general
+            visibility(string): 可选，按可见性筛选: public/private/secret
         """
         if not self.memory_store:
             return "❌ 记忆系统未初始化"
         
         try:
-            memories = await self.memory_store.get_all_memories(category)
+            memories = await self.memory_store.get_all_memories(
+                user_id=event.get_sender_id(),
+                category=category,
+                visibility=visibility
+            )
             
             if not memories:
                 return "暂无记忆"
             
             result = f"共有 {len(memories)} 条记忆:\n\n"
             for i, m in enumerate(memories, 1):
-                result += f"{i}. [ID:{m['id']}] [{m['category']}] {m['content']}\n"
+                result += f"{i}. [ID:{m['id']}] [{m['category']}] [{m['visibility']}] {m['content']}\n"
                 result += f"   重要性: {m['importance']:.2f} | 访问: {m['access_count']}次\n\n"
             
             return result
@@ -279,15 +327,15 @@ class VectorMemoryPlugin(Star):
         if not self.memory_store:
             return "❌ 记忆系统未初始化"
         
-        if not self.is_admin(event.get_sender_id()):
-            return "❌ 权限不足，只有管理员可以删除记忆"
-        
         try:
-            deleted = await self.memory_store.delete_memory(memory_id)
+            deleted = await self.memory_store.delete_memory(
+                memory_id=memory_id,
+                user_id=event.get_sender_id()
+            )
             if deleted:
                 return f"✓ 已删除记忆 ID: {memory_id}"
             else:
-                return f"❌ 未找到记忆 ID: {memory_id}"
+                return f"❌ 未找到记忆 ID: {memory_id} 或权限不足"
         except Exception as e:
             return f"❌ 删除记忆失败: {e}"
     
@@ -298,14 +346,19 @@ class VectorMemoryPlugin(Star):
             return "❌ 记忆系统未初始化"
         
         try:
-            stats = await self.memory_store.get_stats()
+            stats = await self.memory_store.get_stats(user_id=event.get_sender_id())
             
             result = "📊 记忆系统统计:\n\n"
             result += f"总记忆数: {stats['total_memories']}\n"
-            result += f"平均重要性: {stats['avg_importance']:.2f}\n\n"
+            result += f"平均重要性: {stats['avg_importance']:.2f}\n"
+            result += f"当前用户: {stats['user_id']} {'(主人)' if stats['is_master'] else ''}\n\n"
             result += "按类别统计:\n"
             for cat, count in stats['by_category'].items():
                 result += f"  • {cat}: {count} 条\n"
+            
+            result += "\n按可见性统计:\n"
+            for vis, count in stats['by_visibility'].items():
+                result += f"  • {vis}: {count} 条\n"
             
             return result
         except Exception as e:
@@ -337,16 +390,18 @@ class VectorMemoryPlugin(Star):
                 content=test_content,
                 embedding=embedding,
                 category="test",
-                importance=0.8
+                importance=0.8,
+                owner=event.get_sender_id()
             )
             
             # 测试检索
-            memories = await self.memory_store.search_similar(embedding, top_k=1)
+            memories = await self.memory_store.search_similar(embedding, user_id=event.get_sender_id(), top_k=1)
             
             result = f"✓ 记忆系统测试成功!\n"
             result += f"- 存储测试: ID {memory_id}\n"
             result += f"- 检索测试: 找到 {len(memories)} 条记忆\n"
             result += f"- Embedding维度: {len(embedding)}"
+            result += f"- 用户身份: {self.memory_store.get_canonical_user_id(event.get_sender_id())} {'(主人)' if self.memory_store.is_master(event.get_sender_id()) else ''}"
             
             yield event.plain_result(result)
         except Exception as e:
