@@ -28,7 +28,7 @@ MEMORY_RETRIEVAL_PROMPT = """以下是与你相关的长期记忆，请在回答
 @register(
     name="vector_memory",
     desc="向量化长期记忆系统，支持语义检索的主动记忆",
-    version="1.0.0",
+    version="1.2.0",
     author="Neko"
 )
 class VectorMemoryPlugin(Star):
@@ -43,7 +43,6 @@ class VectorMemoryPlugin(Star):
         self.auto_remember = config.get("auto_remember", True)
         self.memory_threshold = config.get("memory_threshold", 5)
         self.top_k = config.get("top_k", 5)
-        self.admin_ids = set(config.get("admin_ids", []))
         self.user_identity_map_list = config.get("user_identity_map", [])
         self.masters = config.get("masters", [])
         
@@ -121,12 +120,6 @@ class VectorMemoryPlugin(Star):
             logger.error(f"向量记忆插件初始化失败: {e}")
             import traceback
             traceback.print_exc()
-    
-    def is_admin(self, user_id: str) -> bool:
-        """检查是否为管理员"""
-        if not self.admin_ids:
-            return True  # 如果未配置管理员，所有人都是管理员
-        return str(user_id) in self.admin_ids
     
     async def get_embedding(self, text: str) -> list[float]:
         """获取文本的向量"""
