@@ -19,6 +19,11 @@
     "description": "检索记忆时返回的最相关记忆数量",
     "default": 5
   },
+  "embedding_cache_size": {
+    "type": "int",
+    "description": "Embedding 缓存大小，用于加速重复查询。设为 0 禁用缓存",
+    "default": 500
+  },
   "user_identity_map": {
     "type": "list",
     "description": "用户身份映射配置，每个元素格式: \"userid=sid1,sid2\"（例如: \"user001=qq_12345,wx_abcde\"）",

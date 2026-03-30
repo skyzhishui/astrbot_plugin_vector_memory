@@ -1,5 +1,5 @@
 name: astrbot_plugin_vector_memory
 description: 向量化长期记忆系统，支持语义检索的主动记忆插件
 author: Neko
-version: 1.3.0
+version: 1.3.1
 repo: https://github.com/skyzhishui/astrbot_plugin_vector_memory

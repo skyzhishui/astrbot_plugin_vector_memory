@@ -4,6 +4,8 @@ AstrBot 向量记忆插件
 """
 
 import asyncio
+import hashlib
+from collections import OrderedDict
 from pathlib import Path
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
@@ -25,10 +27,69 @@ MEMORY_RETRIEVAL_PROMPT = """以下是与你相关的长期记忆，请在回答
 请根据这些记忆内容来回答用户的问题，让用户感受到你记得之前说过的事情。"""
 
 
+class EmbeddingCache:
+    """Embedding 缓存（LRU 策略）"""
+    
+    def __init__(self, max_size: int = 500):
+        self.max_size = max_size
+        self._cache: OrderedDict[str, list[float]] = OrderedDict()
+        self._hits = 0
+        self._misses = 0
+    
+    def _hash_text(self, text: str) -> str:
+        """计算文本的哈希值作为缓存键"""
+        return hashlib.md5(text.encode('utf-8')).hexdigest()
+    
+    def get(self, text: str) -> list[float] | None:
+        """从缓存获取 embedding"""
+        key = self._hash_text(text)
+        if key in self._cache:
+            # LRU: 移到末尾表示最近使用
+            self._cache.move_to_end(key)
+            self._hits += 1
+            return self._cache[key]
+        self._misses += 1
+        return None
+    
+    def set(self, text: str, embedding: list[float]):
+        """设置缓存"""
+        key = self._hash_text(text)
+        
+        # 如果已存在，更新并移到末尾
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            self._cache[key] = embedding
+            return
+        
+        # 检查容量，移除最久未使用的
+        if len(self._cache) >= self.max_size:
+            self._cache.popitem(last=False)
+        
+        self._cache[key] = embedding
+    
+    def stats(self) -> dict:
+        """获取缓存统计"""
+        total = self._hits + self._misses
+        hit_rate = self._hits / total * 100 if total > 0 else 0
+        return {
+            "size": len(self._cache),
+            "max_size": self.max_size,
+            "hits": self._hits,
+            "misses": self._misses,
+            "hit_rate": hit_rate
+        }
+    
+    def clear(self):
+        """清空缓存"""
+        self._cache.clear()
+        self._hits = 0
+        self._misses = 0
+
+
 @register(
     name="vector_memory",
     desc="向量化长期记忆系统，支持语义检索的主动记忆",
-    version="1.3.0",
+    version="1.3.1",
     author="Neko"
 )
 class VectorMemoryPlugin(Star):
@@ -46,6 +107,9 @@ class VectorMemoryPlugin(Star):
         self.user_identity_map_list = config.get("user_identity_map", [])
         self.masters = config.get("masters", [])
         
+        # Embedding 缓存配置
+        self.embedding_cache_size = config.get("embedding_cache_size", 500)
+        
         # 解析身份映射
         self.user_identity_map = self._parse_identity_map(self.user_identity_map_list)
         
@@ -54,15 +118,19 @@ class VectorMemoryPlugin(Star):
         self.memory_extractor: MemoryExtractor = None
         self.embedding_provider: EmbeddingProvider = None
         
+        # Embedding 缓存
+        self._embedding_cache: EmbeddingCache = None
+        
         # 对话计数器（用于自动记忆）
         self._conversation_counts: dict[str, int] = {}
         
-        # 记忆数据库路径 - 修复：使用目录路径而不是文件路径
+        # 记忆数据库路径
         self.db_path = Path("/AstrBot/data/vector_memory/chroma_db")
         
         logger.info("向量记忆插件初始化中...")
         logger.info(f"解析到身份映射: {self.user_identity_map}")
         logger.info(f"主人列表: {self.masters}")
+        logger.info(f"Embedding 缓存大小: {self.embedding_cache_size}")
     
     def _parse_identity_map(self, map_list: list) -> dict:
         """解析身份映射配置列表
@@ -114,18 +182,43 @@ class VectorMemoryPlugin(Star):
             # 初始化记忆提取器
             self.memory_extractor = MemoryExtractor(self.context)
             
+            # 初始化 Embedding 缓存
+            self._embedding_cache = EmbeddingCache(max_size=self.embedding_cache_size)
+            
             logger.info(f"向量记忆插件加载成功！Embedding维度: {embedding_dim}")
+            logger.info(f"Embedding 缓存已启用，最大容量: {self.embedding_cache_size}")
             
         except Exception as e:
             logger.error(f"向量记忆插件初始化失败: {e}")
             import traceback
             traceback.print_exc()
     
-    async def get_embedding(self, text: str) -> list[float]:
-        """获取文本的向量"""
+    async def get_embedding(self, text: str, use_cache: bool = True) -> list[float]:
+        """获取文本的向量（带缓存）
+        
+        Args:
+            text: 要编码的文本
+            use_cache: 是否使用缓存，默认 True
+        """
         if not self.embedding_provider:
             raise ValueError("Embedding Provider 未初始化")
-        return await self.embedding_provider.get_embedding(text)
+        
+        # 尝试从缓存获取
+        if use_cache and self._embedding_cache:
+            cached = self._embedding_cache.get(text)
+            if cached is not None:
+                logger.debug(f"Embedding 缓存命中: {text[:30]}...")
+                return cached
+        
+        # 调用 API 获取 embedding
+        embedding = await self.embedding_provider.get_embedding(text)
+        
+        # 存入缓存
+        if use_cache and self._embedding_cache:
+            self._embedding_cache.set(text, embedding)
+            logger.debug(f"Embedding 已缓存: {text[:30]}...")
+        
+        return embedding
     
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, request: ProviderRequest):
@@ -140,8 +233,8 @@ class VectorMemoryPlugin(Star):
             if not user_message or len(user_message) < 3:
                 return
             
-            # 检索相关记忆
-            query_embedding = await self.get_embedding(user_message)
+            # 检索相关记忆（使用缓存）
+            query_embedding = await self.get_embedding(user_message, use_cache=True)
             memories = await self.memory_store.search_similar(
                 query_embedding=query_embedding,
                 user_id=user_id,
@@ -202,7 +295,7 @@ class VectorMemoryPlugin(Star):
                         
                         # 存储记忆
                         for mem in memories:
-                            embedding = await self.get_embedding(mem["content"])
+                            embedding = await self.get_embedding(mem["content"], use_cache=True)
                             memory_id = await self.memory_store.add_memory(
                                 content=mem["content"],
                                 embedding=embedding,
@@ -238,7 +331,7 @@ class VectorMemoryPlugin(Star):
             return "❌ 记忆系统未初始化"
         
         try:
-            embedding = await self.get_embedding(content)
+            embedding = await self.get_embedding(content, use_cache=True)
             memory_id = await self.memory_store.add_memory(
                 content=content,
                 embedding=embedding,
@@ -269,7 +362,7 @@ class VectorMemoryPlugin(Star):
             return "❌ 记忆系统未初始化"
         
         try:
-            embedding = await self.get_embedding(query)
+            embedding = await self.get_embedding(query, use_cache=True)
             memories = await self.memory_store.search_similar(
                 query_embedding=embedding,
                 user_id=event.get_sender_id(),
@@ -317,7 +410,7 @@ class VectorMemoryPlugin(Star):
             result = f"共有 {len(memories)} 条记忆:\n\n"
             for i, m in enumerate(memories, 1):
                 result += f"{i}. [ID:{m['id']}] [{m['category']}] [{m['visibility']}] {m['content']}\n"
-                # 显示所有者信息 - 修复：使用 is not None 和非空字符串判断
+                # 显示所有者信息
                 owner = m.get('owner', '')
                 owner_info = f"所有者: {owner}" if owner else "所有者: 未设置"
                 result += f"   重要性: {m['importance']:.2f} | 访问: {m['access_count']}次 | {owner_info}\n\n"
@@ -369,6 +462,15 @@ class VectorMemoryPlugin(Star):
             for vis, count in stats['by_visibility'].items():
                 result += f"  • {vis}: {count} 条\n"
             
+            # Embedding 缓存统计
+            if self._embedding_cache:
+                cache_stats = self._embedding_cache.stats()
+                result += f"\n📦 Embedding 缓存:\n"
+                result += f"  • 缓存大小: {cache_stats['size']}/{cache_stats['max_size']}\n"
+                result += f"  • 命中次数: {cache_stats['hits']}\n"
+                result += f"  • 未命中次数: {cache_stats['misses']}\n"
+                result += f"  • 命中率: {cache_stats['hit_rate']:.1f}%\n"
+            
             return result
         except Exception as e:
             return f"❌ 获取统计信息失败: {e}"
@@ -394,7 +496,7 @@ class VectorMemoryPlugin(Star):
         try:
             # 测试存储
             test_content = "这是一条测试记忆"
-            embedding = await self.get_embedding(test_content)
+            embedding = await self.get_embedding(test_content, use_cache=True)
             memory_id = await self.memory_store.add_memory(
                 content=test_content,
                 embedding=embedding,
@@ -412,6 +514,20 @@ class VectorMemoryPlugin(Star):
             result += f"- Embedding维度: {len(embedding)}\n"
             result += f"- 用户身份: {self.memory_store.get_canonical_user_id(event.get_sender_id())} {'(主人)' if self.memory_store.is_master(event.get_sender_id()) else ''}"
             
+            # 缓存测试
+            if self._embedding_cache:
+                cache_stats = self._embedding_cache.stats()
+                result += f"\n- 缓存命中率: {cache_stats['hit_rate']:.1f}%"
+            
             yield event.plain_result(result)
         except Exception as e:
             yield event.plain_result(f"❌ 测试失败: {e}")
+    
+    @filter.command("memory_cache_clear")
+    async def cmd_cache_clear(self, event: AstrMessageEvent):
+        """清空 Embedding 缓存"""
+        if self._embedding_cache:
+            self._embedding_cache.clear()
+            yield event.plain_result("✓ Embedding 缓存已清空")
+        else:
+            yield event.plain_result("❌ 缓存未初始化")
