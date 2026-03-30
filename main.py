@@ -28,7 +28,7 @@ MEMORY_RETRIEVAL_PROMPT = """以下是与你相关的长期记忆，请在回答
 @register(
     name="vector_memory",
     desc="向量化长期记忆系统，支持语义检索的主动记忆",
-    version="1.2.1",
+    version="1.3.0",
     author="Neko"
 )
 class VectorMemoryPlugin(Star):
@@ -203,7 +203,7 @@ class VectorMemoryPlugin(Star):
                         # 存储记忆
                         for mem in memories:
                             embedding = await self.get_embedding(mem["content"])
-                            await self.memory_store.add_memory(
+                            memory_id = await self.memory_store.add_memory(
                                 content=mem["content"],
                                 embedding=embedding,
                                 category=mem.get("category", "general"),
@@ -211,6 +211,9 @@ class VectorMemoryPlugin(Star):
                                 source=f"session:{session_id}",
                                 owner=event.get_sender_id()
                             )
+                            # 记录去重情况
+                            if memory_id < 0:
+                                logger.info(f"自动记忆去重: {mem['content'][:30]}... (已存在ID: {-memory_id})")
                         
                         # 重置计数器
                         self._conversation_counts[session_id] = 0
@@ -245,6 +248,11 @@ class VectorMemoryPlugin(Star):
                 visibility=visibility,
                 owner=event.get_sender_id()
             )
+            
+            # 检查是否是重复记忆（返回负数ID）
+            if memory_id < 0:
+                return f"⚠️ 检测到重复记忆，已跳过。相似记忆 ID: {-memory_id}"
+            
             return f"✓ 已记住: {content} (ID: {memory_id}, 类别: {category}, 可见性: {visibility})"
         except Exception as e:
             return f"❌ 记忆存储失败: {e}"

@@ -1,7 +1,7 @@
 """
 向量记忆存储模块
 使用 ChromaDB 实现向量存储
-支持：公共记忆、用户专属记忆、秘密记忆
+支持：公共记忆、用户专属记忆、秘密记忆、去重机制
 """
 
 import asyncio
@@ -26,7 +26,14 @@ class VectorMemoryStore:
     - public: 公共记忆，所有用户可见（如主人的家庭成员、基本设定）
     - private: 用户专属记忆，仅该用户可见
     - secret: 秘密记忆，仅特定用户触发时可见
+    
+    去重机制:
+    - 添加记忆前会检查是否存在语义相似的记忆
+    - 相似度超过阈值（默认0.95）的记忆会被跳过
     """
+    
+    # 去重相似度阈值（0-1，越高要求越严格）
+    DEDUP_SIMILARITY_THRESHOLD = 0.95
     
     def __init__(
         self, 
@@ -67,6 +74,7 @@ class VectorMemoryStore:
         
         logger.info(f"ChromaDB 向量记忆存储初始化完成: {self.db_path}")
         logger.info(f"加载身份映射: {len(self.user_identity_map)} 条，主人列表: {self.masters}")
+        logger.info(f"去重相似度阈值: {self.DEDUP_SIMILARITY_THRESHOLD}")
     
     def get_canonical_user_id(self, session_id: str) -> str:
         """获取用户的规范ID（处理多身份关联）"""
@@ -77,6 +85,55 @@ class VectorMemoryStore:
         canonical_id = self.get_canonical_user_id(session_id)
         return canonical_id in self.masters
     
+    async def _check_duplicate(self, embedding: list[float], content: str, owner: str) -> Optional[int]:
+        """检查是否存在重复记忆
+        
+        Args:
+            embedding: 向量
+            content: 内容（用于日志）
+            owner: 所有者
+            
+        Returns:
+            如果存在重复，返回已存在的记忆ID；否则返回None
+        """
+        def _check():
+            # 搜索相似记忆
+            results = self.collection.query(
+                query_embeddings=[embedding],
+                n_results=5,  # 只检查前5个最相似的
+                include=["documents", "metadatas", "distances"]
+            )
+            
+            if not results["ids"] or not results["ids"][0]:
+                return None
+            
+            canonical_owner = self.get_canonical_user_id(owner) if owner else None
+            
+            for i, memory_id in enumerate(results["ids"][0]):
+                distance = results["distances"][0][i]
+                similarity = 1.0 - distance
+                
+                # 相似度超过阈值
+                if similarity >= self.DEDUP_SIMILARITY_THRESHOLD:
+                    metadata = results["metadatas"][0][i]
+                    existing_owner = metadata.get("owner", "")
+                    existing_content = results["documents"][0][i]
+                    
+                    # 检查是否是同一用户的记忆（或者都是公共记忆）
+                    existing_canonical_owner = self.get_canonical_user_id(existing_owner) if existing_owner else None
+                    
+                    # 如果所有者相同，或者都是公共记忆，则认为是重复
+                    if (canonical_owner == existing_canonical_owner) or \
+                       (metadata.get("visibility") == "public" and not existing_owner):
+                        logger.info(f"检测到重复记忆 (相似度: {similarity:.3f}):")
+                        logger.info(f"  已存在: {existing_content[:50]}...")
+                        logger.info(f"  新增: {content[:50]}...")
+                        return int(memory_id)
+            
+            return None
+        
+        return await asyncio.get_event_loop().run_in_executor(None, _check)
+    
     async def add_memory(
         self,
         content: str,
@@ -86,9 +143,10 @@ class VectorMemoryStore:
         source: Optional[str] = None,
         visibility: str = "public",
         owner: Optional[str] = None,
-        allowed_users: Optional[list[str]] = None
+        allowed_users: Optional[list[str]] = None,
+        skip_duplicate_check: bool = False
     ) -> int:
-        """添加记忆
+        """添加记忆（带去重检查）
         
         Args:
             content: 记忆内容
@@ -99,7 +157,18 @@ class VectorMemoryStore:
             visibility: 可见性 (public/private/secret)
             owner: 所有者（用户ID）
             allowed_users: 允许访问的用户列表（用于秘密记忆）
+            skip_duplicate_check: 是否跳过去重检查（默认False）
+            
+        Returns:
+            记忆ID，如果重复则返回已存在记忆的ID（负数表示是重复的）
         """
+        # 去重检查
+        if not skip_duplicate_check:
+            duplicate_id = await self._check_duplicate(embedding, content, owner)
+            if duplicate_id is not None:
+                logger.info(f"跳过重复记忆，使用已存在的记忆 ID: {duplicate_id}")
+                return -duplicate_id  # 返回负数表示是重复的
+        
         async with self._lock:
             def _add():
                 import time
