@@ -1,10 +1,12 @@
 """
 AstrBot 向量记忆插件
 实现基于向量语义检索的长期记忆系统
+支持分层记忆架构（L0/L1/L2/L3）
 """
 
 import asyncio
 import hashlib
+import re
 from collections import OrderedDict
 from pathlib import Path
 from astrbot.api.star import Context, Star, register
@@ -12,6 +14,7 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api import AstrBotConfig, logger
 from astrbot.core.provider.provider import EmbeddingProvider
 from astrbot.api.provider import ProviderRequest
+from astrbot.core.star.star_tools import StarTools
 
 from .memory_store import VectorMemoryStore
 from .memory_extractor import MemoryExtractor
@@ -86,14 +89,59 @@ class EmbeddingCache:
         self._misses = 0
 
 
+class KeywordMatcher:
+    """关键词匹配器"""
+    
+    # L1 层关键词映射（根据优化方案）
+    L1_KEYWORD_MAP = {
+    }
+    
+    @classmethod
+    def convert_list_to_dict(cls, input_list):
+
+        cls.L1_KEYWORD_MAP = {}
+        try:
+            for item in input_list:
+                key, values_str = item.split('=')
+                values_list = values_str.split(',')
+                # 2. 将结果赋值给类变量
+                cls.L1_KEYWORD_MAP[key] = values_list
+        
+            logger.info("L1层关键词映射完成填充...")
+        except Exception as e:
+            logger.error(f"加载L1层关键词映射失败: {e}")
+    
+    
+    @classmethod
+    def get_memory_keywords(cls, text: str) -> list[str]:
+        """获取应该触发的记忆关键词
+        
+        Args:
+            text: 输入文本
+            
+        Returns:
+            应该触发的记忆关键词列表
+        """
+        keywords = set()
+        
+        for key, trigger_words in cls.L1_KEYWORD_MAP.items():
+            for word in trigger_words:
+                if word in text:
+                    # 添加触发词本身
+                    keywords.add(key)
+                    break
+        
+        return list(keywords)
+
+
 @register(
     name="vector_memory",
-    desc="向量化长期记忆系统，支持语义检索的主动记忆",
-    version="1.3.1",
+    desc="向量化长期记忆系统，支持语义检索的主动记忆（分层架构）",
+    version="1.4.0",
     author="Neko"
 )
 class VectorMemoryPlugin(Star):
-    """向量记忆插件"""
+    """向量记忆插件 - 支持分层架构"""
     
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -106,6 +154,11 @@ class VectorMemoryPlugin(Star):
         self.top_k = config.get("top_k", 5)
         self.user_identity_map_list = config.get("user_identity_map", [])
         self.masters = config.get("masters", [])
+        
+        # 获取关键词映射配置
+        self.l1_keyword_map_config = config.get("l1_keyword_map", [])
+        KeywordMatcher.convert_list_to_dict(self.l1_keyword_map_config)
+        #logger.info(f"L1映射配置: {self.l1_keyword_map_config}")
         
         # Embedding 缓存配置
         self.embedding_cache_size = config.get("embedding_cache_size", 500)
@@ -124,8 +177,11 @@ class VectorMemoryPlugin(Star):
         # 对话计数器（用于自动记忆）
         self._conversation_counts: dict[str, int] = {}
         
-        # 记忆数据库路径
-        self.db_path = Path("/AstrBot/data/vector_memory/chroma_db")
+        # 记忆数据库路径（将在 initialize 中使用 StarTools 设置）
+        self.db_path = None
+        
+        # 缓存预热标志
+        self._cache_warmed = False
         
         logger.info("向量记忆插件初始化中...")
         logger.info(f"解析到身份映射: {self.user_identity_map}")
@@ -155,6 +211,11 @@ class VectorMemoryPlugin(Star):
     async def initialize(self):
         """插件激活时调用"""
         try:
+            # 使用 StarTools 获取插件数据目录
+            data_dir = StarTools.get_data_dir()
+            self.db_path = data_dir / "chroma_db"
+            logger.info(f"记忆数据库路径: {self.db_path}")
+            
             # 获取 Embedding Provider
             if not self.embedding_provider_id:
                 logger.warning("未配置 embedding_provider_id，请在配置中设置")
@@ -165,7 +226,7 @@ class VectorMemoryPlugin(Star):
                 if provider.meta().id == self.embedding_provider_id:
                     self.embedding_provider = provider
                     break
-            
+            logger.info(f"Embedding Provider: {self.embedding_provider}")
             if not self.embedding_provider:
                 logger.error(f"未找到 Embedding Provider: {self.embedding_provider_id}")
                 return
@@ -187,6 +248,12 @@ class VectorMemoryPlugin(Star):
             
             logger.info(f"向量记忆插件加载成功！Embedding维度: {embedding_dim}")
             logger.info(f"Embedding 缓存已启用，最大容量: {self.embedding_cache_size}")
+            
+            # 预热缓存（L0 + L1 层）
+            logger.info("开始预热 L0/L1 层记忆缓存...")
+            await self.memory_store.warmup_cache(self.get_embedding)
+            self._cache_warmed = True
+            logger.info("缓存预热完成！")
             
         except Exception as e:
             logger.error(f"向量记忆插件初始化失败: {e}")
@@ -220,9 +287,63 @@ class VectorMemoryPlugin(Star):
         
         return embedding
     
+    async def get_context_memories(self, user_input: str, user_id: str) -> str:
+        """分层获取上下文记忆
+        
+        Args:
+            user_input: 用户输入
+            user_id: 用户ID
+            
+        Returns:
+            格式化的记忆上下文
+        """
+        if not self.memory_store:
+            return ""
+        
+        memory_texts = []
+        
+        try:
+            # 1. 始终加载 L0 层（核心层）
+            l0_memories = await self.memory_store.get_layer_memories("L0")
+            if l0_memories:
+                logger.info(f"[L0] 加载核心层记忆: {len(l0_memories)} 条")
+                for m in l0_memories:
+                    memory_texts.append(f"[L0-{m['category']}] {m['content']} (重要性: {m['importance']:.2f})")
+            
+            # 2. 关键词匹配 L1 层（高频层）
+            keywords = KeywordMatcher.get_memory_keywords(user_input)
+            if keywords:
+                l1_memories = await self.memory_store.get_layer_memories("L1", keywords=keywords)
+                if l1_memories:
+                    logger.info(f"[L1] 关键词触发 '{keywords}'，加载高频层记忆: {len(l1_memories)} 条")
+                    for m in l1_memories:
+                        memory_texts.append(f"[L1-{m['category']}] {m['content']} (重要性: {m['importance']:.2f})")
+            
+            # 3. 向量检索 L2 层（普通层）
+            query_embedding = await self.get_embedding(user_input, use_cache=True)
+            l2_memories = await self.memory_store.search_in_layer(
+                query_embedding=query_embedding,
+                layer="L2",
+                top_k=3
+            )
+            if l2_memories:
+                logger.info(f"[L2] 向量检索普通层记忆: {len(l2_memories)} 条")
+                for m in l2_memories:
+                    memory_texts.append(f"[L2-{m['category']}] {m['content']} (相关度: {m['similarity']:.2f})")
+            
+            # 4. L3 层（归档层）仅在明确询问时加载（这里暂不自动加载）
+            
+            if memory_texts:
+                return "\n".join(memory_texts)
+            
+        except Exception as e:
+            logger.error(f"分层记忆检索失败: {e}")
+        
+        return ""
+    
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, request: ProviderRequest):
-        """LLM请求前处理 - 自动检索相关记忆并注入"""
+        """LLM请求前处理 - 分层检索相关记忆并注入"""
         if not self.memory_store:
             return
         
@@ -233,24 +354,12 @@ class VectorMemoryPlugin(Star):
             if not user_message or len(user_message) < 3:
                 return
             
-            # 检索相关记忆（使用缓存）
-            query_embedding = await self.get_embedding(user_message, use_cache=True)
-            memories = await self.memory_store.search_similar(
-                query_embedding=query_embedding,
-                user_id=user_id,
-                top_k=self.top_k
-            )
+            # 分层检索记忆
+            memory_context = await self.get_context_memories(user_message, user_id)
             
             # 如果有相关记忆，注入到上下文
-            if memories:
-                memory_texts = []
-                for m in memories:
-                    memory_texts.append(f"[{m['category']}] {m['content']} (相关度: {m['similarity']:.2f})")
-                    # 增加访问计数
-                    await self.memory_store.increment_access_count(m['id'])
-                
-                memory_context = "\n".join(memory_texts)
-                logger.info(f"检索到 {len(memories)} 条相关记忆")
+            if memory_context:
+                logger.info(f"检索到相关记忆，准备注入上下文")
                 
                 # 将记忆信息注入到系统提示词
                 memory_prompt = MEMORY_RETRIEVAL_PROMPT.format(memories=memory_context)
@@ -296,13 +405,24 @@ class VectorMemoryPlugin(Star):
                         # 存储记忆
                         for mem in memories:
                             embedding = await self.get_embedding(mem["content"], use_cache=True)
+                            
+                            # 根据重要性决定层级
+                            importance = mem.get("importance", 0.5)
+                            if importance >= 0.9:
+                                layer = "L1"
+                            elif importance >= 0.7:
+                                layer = "L2"
+                            else:
+                                layer = "L2"
+                            
                             memory_id = await self.memory_store.add_memory(
                                 content=mem["content"],
                                 embedding=embedding,
                                 category=mem.get("category", "general"),
-                                importance=mem.get("importance", 0.5),
+                                importance=importance,
                                 source=f"session:{session_id}",
-                                owner=event.get_sender_id()
+                                owner=event.get_sender_id(),
+                                layer=layer
                             )
                             # 记录去重情况
                             if memory_id < 0:
@@ -318,7 +438,7 @@ class VectorMemoryPlugin(Star):
     # ============ LLM 工具 ============
     
     @filter.llm_tool(name="remember")
-    async def tool_remember(self, event: AstrMessageEvent, content: str, category: str = "general", importance: float = 0.5, visibility: str = "private") -> str:
+    async def tool_remember(self, event: AstrMessageEvent, content: str, category: str = "general", importance: float = 0.5, visibility: str = "private", layer: str = "L2", keywords: str = "") -> str:
         """主动记住一条信息
         
         Args:
@@ -326,12 +446,18 @@ class VectorMemoryPlugin(Star):
             category(string): 记忆类别: preference(偏好), fact(事实), personal(个人信息), event(事件), task(任务), general(通用), secret(秘密)
             importance(number): 重要性 0.0-1.0，默认0.5
             visibility(string): 可见性: public(公共)/private(用户专属)/secret(秘密)，默认private
+            layer(string): 分层: L0(核心层)/L1(高频层)/L2(普通层)/L3(归档层)，默认L2
+            keywords(string): 关键词，用逗号分隔（用于L1层触发）
         """
         if not self.memory_store:
             return "❌ 记忆系统未初始化"
         
         try:
             embedding = await self.get_embedding(content, use_cache=True)
+            
+            # 解析关键词
+            keyword_list = [k.strip() for k in keywords.split(",") if k.strip()] if keywords else None
+            
             memory_id = await self.memory_store.add_memory(
                 content=content,
                 embedding=embedding,
@@ -339,34 +465,40 @@ class VectorMemoryPlugin(Star):
                 importance=importance,
                 source=f"user:{event.get_sender_id()}",
                 visibility=visibility,
-                owner=event.get_sender_id()
+                owner=event.get_sender_id(),
+                layer=layer,
+                keywords=keyword_list
             )
             
             # 检查是否是重复记忆（返回负数ID）
             if memory_id < 0:
                 return f"⚠️ 检测到重复记忆，已跳过。相似记忆 ID: {-memory_id}"
             
-            return f"✓ 已记住: {content} (ID: {memory_id}, 类别: {category}, 可见性: {visibility})"
+            return f"✓ 已记住: {content} (ID: {memory_id}, 层级: {layer}, 类别: {category}, 可见性: {visibility})"
         except Exception as e:
             return f"❌ 记忆存储失败: {e}"
     
     @filter.llm_tool(name="recall_memories")
-    async def tool_recall_memories(self, event: AstrMessageEvent, query: str, top_k: int = 5) -> str:
+    async def tool_recall_memories(self, event: AstrMessageEvent, query: str, top_k: int = 5, layer: str = "") -> str:
         """搜索相关记忆
         
         Args:
             query(string): 搜索关键词或问题
             top_k(number): 返回的记忆数量，默认5
+            layer(string): 可选，限定层级: L0/L1/L2/L3
         """
         if not self.memory_store:
             return "❌ 记忆系统未初始化"
         
         try:
             embedding = await self.get_embedding(query, use_cache=True)
+            
+            layer_filter = layer if layer else None
             memories = await self.memory_store.search_similar(
                 query_embedding=embedding,
                 user_id=event.get_sender_id(),
-                top_k=top_k
+                top_k=top_k,
+                layer=layer_filter
             )
             
             if not memories:
@@ -374,7 +506,7 @@ class VectorMemoryPlugin(Star):
             
             result = f"找到 {len(memories)} 条相关记忆:\n\n"
             for i, m in enumerate(memories, 1):
-                result += f"{i}. [{m['category']}] {m['content']}\n"
+                result += f"{i}. [{m['layer']}] [{m['category']}] {m['content']}\n"
                 result += f"   相关度: {m['similarity']:.2f} | 重要性: {m['importance']:.2f} | 可见性: {m['visibility']}\n"
                 # 显示所有者信息
                 owner = m.get('owner', '')
@@ -387,12 +519,13 @@ class VectorMemoryPlugin(Star):
             return f"❌ 记忆检索失败: {e}"
     
     @filter.llm_tool(name="list_memories")
-    async def tool_list_memories(self, event: AstrMessageEvent, category: str = None, visibility: str = None) -> str:
+    async def tool_list_memories(self, event: AstrMessageEvent, category: str = None, visibility: str = None, layer: str = None) -> str:
         """列出所有记忆
         
         Args:
             category(string): 可选，按类别筛选: preference, fact, personal, event, task, general, secret
             visibility(string): 可选，按可见性筛选: public/private/secret
+            layer(string): 可选，按层级筛选: L0/L1/L2/L3
         """
         if not self.memory_store:
             return "❌ 记忆系统未初始化"
@@ -401,7 +534,8 @@ class VectorMemoryPlugin(Star):
             memories = await self.memory_store.get_all_memories(
                 user_id=event.get_sender_id(),
                 category=category,
-                visibility=visibility
+                visibility=visibility,
+                layer=layer
             )
             
             if not memories:
@@ -409,7 +543,7 @@ class VectorMemoryPlugin(Star):
             
             result = f"共有 {len(memories)} 条记忆:\n\n"
             for i, m in enumerate(memories, 1):
-                result += f"{i}. [ID:{m['id']}] [{m['category']}] [{m['visibility']}] {m['content']}\n"
+                result += f"{i}. [ID:{m['id']}] [{m['layer']}] [{m['category']}] [{m['visibility']}] {m['content']}\n"
                 # 显示所有者信息
                 owner = m.get('owner', '')
                 owner_info = f"所有者: {owner}" if owner else "所有者: 未设置"
@@ -441,6 +575,29 @@ class VectorMemoryPlugin(Star):
         except Exception as e:
             return f"❌ 删除记忆失败: {e}"
     
+    @filter.llm_tool(name="update_memory_layer")
+    async def tool_update_memory_layer(self, event: AstrMessageEvent, memory_id: int, layer: str) -> str:
+        """更新记忆的层级
+        
+        Args:
+            memory_id(number): 记忆ID
+            layer(string): 新层级: L0/L1/L2/L3
+        """
+        if not self.memory_store:
+            return "❌ 记忆系统未初始化"
+        
+        try:
+            updated = await self.memory_store.update_layer(
+                memory_id=memory_id,
+                layer=layer
+            )
+            if updated:
+                return f"✓ 已更新记忆 ID: {memory_id} 到层级 {layer}"
+            else:
+                return f"❌ 未找到记忆 ID: {memory_id}"
+        except Exception as e:
+            return f"❌ 更新记忆层级失败: {e}"
+    
     @filter.llm_tool(name="memory_stats")
     async def tool_memory_stats(self, event: AstrMessageEvent) -> str:
         """查看记忆系统统计信息"""
@@ -454,7 +611,12 @@ class VectorMemoryPlugin(Star):
             result += f"总记忆数: {stats['total_memories']}\n"
             result += f"平均重要性: {stats['avg_importance']:.2f}\n"
             result += f"当前用户: {stats['user_id']} {'(主人)' if stats['is_master'] else ''}\n\n"
-            result += "按类别统计:\n"
+            
+            result += "按层级统计:\n"
+            for layer, count in stats['by_layer'].items():
+                result += f"  • {layer}: {count} 条\n"
+            
+            result += "\n按类别统计:\n"
             for cat, count in stats['by_category'].items():
                 result += f"  • {cat}: {count} 条\n"
             
@@ -470,6 +632,9 @@ class VectorMemoryPlugin(Star):
                 result += f"  • 命中次数: {cache_stats['hits']}\n"
                 result += f"  • 未命中次数: {cache_stats['misses']}\n"
                 result += f"  • 命中率: {cache_stats['hit_rate']:.1f}%\n"
+            
+            # 缓存预热状态
+            result += f"\n🔥 缓存预热: {'已完成' if self._cache_warmed else '未完成'}\n"
             
             return result
         except Exception as e:
@@ -502,7 +667,8 @@ class VectorMemoryPlugin(Star):
                 embedding=embedding,
                 category="test",
                 importance=0.8,
-                owner=event.get_sender_id()
+                owner=event.get_sender_id(),
+                layer="L2"
             )
             
             # 测试检索
@@ -512,7 +678,9 @@ class VectorMemoryPlugin(Star):
             result += f"- 存储测试: ID {memory_id}\n"
             result += f"- 检索测试: 找到 {len(memories)} 条记忆\n"
             result += f"- Embedding维度: {len(embedding)}\n"
-            result += f"- 用户身份: {self.memory_store.get_canonical_user_id(event.get_sender_id())} {'(主人)' if self.memory_store.is_master(event.get_sender_id()) else ''}"
+            result += f"- 数据目录: {self.db_path.parent}\n"
+            result += f"- 用户身份: {self.memory_store.get_canonical_user_id(event.get_sender_id())} {'(主人)' if self.memory_store.is_master(event.get_sender_id()) else ''}\n"
+            result += f"- 缓存预热: {'已完成' if self._cache_warmed else '未完成'}"
             
             # 缓存测试
             if self._embedding_cache:
@@ -531,3 +699,41 @@ class VectorMemoryPlugin(Star):
             yield event.plain_result("✓ Embedding 缓存已清空")
         else:
             yield event.plain_result("❌ 缓存未初始化")
+    
+    @filter.command("memory_warmup")
+    async def cmd_memory_warmup(self, event: AstrMessageEvent):
+        """手动预热缓存"""
+        if not self.memory_store:
+            yield event.plain_result("❌ 记忆系统未初始化")
+            return
+        
+        try:
+            await self.memory_store.warmup_cache(self.get_embedding)
+            self._cache_warmed = True
+            yield event.plain_result("✓ 缓存预热完成！L0/L1 层记忆已加载")
+        except Exception as e:
+            yield event.plain_result(f"❌ 缓存预热失败: {e}")
+    
+    @filter.command("memory_layers")
+    async def cmd_memory_layers(self, event: AstrMessageEvent):
+        """查看各层记忆统计"""
+        if not self.memory_store:
+            yield event.plain_result("❌ 记忆系统未初始化")
+            return
+        
+        try:
+            result = "📊 分层记忆统计:\n\n"
+            
+            for layer in ["L0", "L1", "L2", "L3"]:
+                memories = await self.memory_store.get_layer_memories(layer)
+                layer_info = VectorMemoryStore.LAYERS.get(layer, {})
+                result += f"{layer} ({layer_info.get('desc', '')}):\n"
+                result += f"  • 加载策略: {layer_info.get('load_strategy', '')}\n"
+                result += f"  • 记忆数量: {len(memories)} 条\n"
+                if memories:
+                    result += f"  • 平均重要性: {sum(m['importance'] for m in memories) / len(memories):.2f}\n"
+                result += "\n"
+            
+            yield event.plain_result(result)
+        except Exception as e:
+            yield event.plain_result(f"❌ 获取分层统计失败: {e}")
