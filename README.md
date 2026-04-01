@@ -16,7 +16,7 @@
 - 🚀 **ChromaDB 驱动**: 使用 ChromaDB 实现高效的向量索引和检索
 - 🎯 **分层架构**: L0/L1/L2/L3 四层记忆架构，优化 Token 消耗
 
-## 🆕 v1.4.0 新特性：分层记忆架构
+## 🥕 v1.4.0 新特性：分层记忆架构
 
 ### 分层架构说明
 
@@ -65,6 +65,7 @@ L1 层记忆支持关键词触发预加载：
 | `embedding_cache_size` | Embedding 缓存大小，设为 0 禁用缓存 | 500 |
 | `user_identity_map` | 用户身份映射配置（列表格式） | [] |
 | `masters` | 主人列表，拥有最高权限（可查看和删除所有记忆） | [] |
+| `l1_keyword_map` | L1层关键词映射配置（列表格式） | [] |
 
 ### 用户身份映射配置
 
@@ -85,6 +86,24 @@ L1 层记忆支持关键词触发预加载：
 - `qq_12345` 和 `wx_abcde` 都是 `user001` 的身份
 - `qq_67890` 和 `wx_fghij` 都是 `user002` 的身份
 - `user001` 和 `user002` 是主人，拥有最高权限
+
+### L1层关键词映射配置
+
+`l1_keyword_map` 是一个字符串列表，每个元素格式为 `"触发词=关键词1,关键词2,..."`。
+
+**示例配置：**
+```json
+{
+  "l1_keyword_map": [
+    "家人=家人,孩子,小孩",
+    "生日=生日,纪念日",
+    "ComfyUI=ComfyUI,绘图,画图,图片生成",
+    "Sonos=Sonos,音箱,语音,TTS"
+  ]
+}
+```
+
+当用户输入包含"家人"、"孩子"、"小孩"或"孩子"时，会触发L1层中关键词包含"家人"的记忆。
 
 ## 🔐 记忆可见性分层
 
@@ -182,7 +201,17 @@ AI: 找到 2 条相关记忆:
 
 ## 📁 数据存储
 
-记忆数据存储在 `/AstrBot/data/vector_memory/` 目录（ChromaDB 持久化存储）
+记忆数据使用 ChromaDB 持久化存储，存储位置为：
+
+```
+/AstrBot/data/plugin_data/astrbot_plugin_vector_memory/chroma_db/
+```
+
+该目录下包含：
+- `chroma.sqlite3` - 向量索引数据库
+- `*-embedding/` - Embedding 文件存储
+
+> **注意**: 记忆数据存储在 `plugin_data` 目录下，与插件目录分离，迁移插件时不会丢失记忆数据。
 
 ## 🔧 技术架构
 
@@ -235,6 +264,14 @@ def get_context_memories(user_input: str) -> str:
 | `general` | 通用记忆 | 其他信息 |
 
 ## 📋 更新日志
+
+### v1.4.1 (2026-04-01)
+- 📝 修复：secret 记忆的权限逻辑（无 allowed_users 时仅 owner 可访问）
+- 🛠️ 新增：`remember` 工具支持 `allowed_users` 参数
+- 🛠️ 新增：`list_memories` 工具显示 allowed_users 信息
+- 🛠️ 新增：`update_memory_visibility` 工具更新记忆可见性
+- ⚙️ 新增：L1 层关键词映射配置（`l1_keyword_map`）
+- 📝 优化：README 数据存储位置说明
 
 ### v1.4.0 (2026-03-31)
 - 🎯 **重大更新**：分层记忆架构（L0/L1/L2/L3）
