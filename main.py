@@ -160,6 +160,9 @@ class VectorMemoryPlugin(Star):
         KeywordMatcher.convert_list_to_dict(self.l1_keyword_map_config)
         #logger.info(f"L1映射配置: {self.l1_keyword_map_config}")
         
+        # L1关键字触发跳过L2检索的配置
+        self.l1_trigger_skip_l2 = config.get("l1_trigger_skip_l2", False)
+        
         # Embedding 缓存配置
         self.embedding_cache_size = config.get("embedding_cache_size", 500)
         
@@ -318,7 +321,11 @@ class VectorMemoryPlugin(Star):
                     logger.info(f"[L1] 关键词触发 '{keywords}'，加载高频层记忆: {len(l1_memories)} 条")
                     for m in l1_memories:
                         memory_texts.append(f"[L1-{m['category']}] {m['content']} (重要性: {m['importance']:.2f})")
-            
+                    # 当L1关键词匹配成功时，可选择跳过L2检索
+                    if self.l1_trigger_skip_l2:
+                        # L1已找到相关记忆，跳过L2
+                        return "\n".join(memory_texts)
+
             # 3. 向量检索 L2 层（普通层）
             query_embedding = await self.get_embedding(user_input, use_cache=True)
             l2_memories = await self.memory_store.search_in_layer(
@@ -438,7 +445,17 @@ class VectorMemoryPlugin(Star):
     # ============ LLM 工具 ============
     
     @filter.llm_tool(name="remember")
-    async def tool_remember(self, event: AstrMessageEvent, content: str, category: str = "general", importance: float = 0.5, visibility: str = "private", layer: str = "L2", keywords: str = "") -> str:
+    async def tool_remember(
+        self, 
+        event: AstrMessageEvent, 
+        content: str, 
+        category: str = "general", 
+        importance: float = 0.5, 
+        visibility: str = "private", 
+        layer: str = "L2", 
+        keywords: str = "",
+        allowed_users: str = ""
+    ) -> str:
         """主动记住一条信息
         
         Args:
@@ -448,6 +465,7 @@ class VectorMemoryPlugin(Star):
             visibility(string): 可见性: public(公共)/private(用户专属)/secret(秘密)，默认private
             layer(string): 分层: L0(核心层)/L1(高频层)/L2(普通层)/L3(归档层)，默认L2
             keywords(string): 关键词，用逗号分隔（用于L1层触发）
+            allowed_users(string): 允许访问的用户ID，用逗号分隔（用于secret记忆）
         """
         if not self.memory_store:
             return "❌ 记忆系统未初始化"
@@ -458,6 +476,9 @@ class VectorMemoryPlugin(Star):
             # 解析关键词
             keyword_list = [k.strip() for k in keywords.split(",") if k.strip()] if keywords else None
             
+            # 解析 allowed_users
+            allowed_users_list = [u.strip() for u in allowed_users.split(",") if u.strip()] if allowed_users else None
+            
             memory_id = await self.memory_store.add_memory(
                 content=content,
                 embedding=embedding,
@@ -467,14 +488,18 @@ class VectorMemoryPlugin(Star):
                 visibility=visibility,
                 owner=event.get_sender_id(),
                 layer=layer,
-                keywords=keyword_list
+                keywords=keyword_list,
+                allowed_users=allowed_users_list
             )
             
             # 检查是否是重复记忆（返回负数ID）
             if memory_id < 0:
                 return f"⚠️ 检测到重复记忆，已跳过。相似记忆 ID: {-memory_id}"
             
-            return f"✓ 已记住: {content} (ID: {memory_id}, 层级: {layer}, 类别: {category}, 可见性: {visibility})"
+            result = f"✓ 已记住: {content} (ID: {memory_id}, 层级: {layer}, 类别: {category}, 可见性: {visibility})"
+            if allowed_users_list:
+                result += f", 允许用户: {', '.join(allowed_users_list)}"
+            return result
         except Exception as e:
             return f"❌ 记忆存储失败: {e}"
     
@@ -547,7 +572,10 @@ class VectorMemoryPlugin(Star):
                 # 显示所有者信息
                 owner = m.get('owner', '')
                 owner_info = f"所有者: {owner}" if owner else "所有者: 未设置"
-                result += f"   重要性: {m['importance']:.2f} | 访问: {m['access_count']}次 | {owner_info}\n\n"
+                # 显示 allowed_users 信息
+                allowed_users = m.get('allowed_users', '')
+                allowed_info = f" | 允许用户: {allowed_users}" if allowed_users else ""
+                result += f"   重要性: {m['importance']:.2f} | 访问: {m['access_count']}次 | {owner_info}{allowed_info}\n\n"
             
             return result
         except Exception as e:
@@ -597,6 +625,44 @@ class VectorMemoryPlugin(Star):
                 return f"❌ 未找到记忆 ID: {memory_id}"
         except Exception as e:
             return f"❌ 更新记忆层级失败: {e}"
+    
+    @filter.llm_tool(name="update_memory_visibility")
+    async def tool_update_memory_visibility(
+        self, 
+        event: AstrMessageEvent, 
+        memory_id: int, 
+        visibility: str,
+        allowed_users: str = ""
+    ) -> str:
+        """更新记忆的可见性
+        
+        Args:
+            memory_id(number): 记忆ID
+            visibility(string): 新可见性: public/private/secret
+            allowed_users(string): 允许访问的用户ID，用逗号分隔（用于secret记忆）
+        """
+        if not self.memory_store:
+            return "❌ 记忆系统未初始化"
+        
+        try:
+            # 解析 allowed_users
+            allowed_users_list = [u.strip() for u in allowed_users.split(",") if u.strip()] if allowed_users else None
+            
+            updated = await self.memory_store.update_visibility(
+                memory_id=memory_id,
+                visibility=visibility,
+                user_id=event.get_sender_id(),
+                allowed_users=allowed_users_list
+            )
+            if updated:
+                result = f"✓ 已更新记忆 ID: {memory_id} 的可见性为 {visibility}"
+                if allowed_users_list:
+                    result += f"，允许用户: {', '.join(allowed_users_list)}"
+                return result
+            else:
+                return f"❌ 未找到记忆 ID: {memory_id} 或权限不足"
+        except Exception as e:
+            return f"❌ 更新记忆可见性失败: {e}"
     
     @filter.llm_tool(name="memory_stats")
     async def tool_memory_stats(self, event: AstrMessageEvent) -> str:

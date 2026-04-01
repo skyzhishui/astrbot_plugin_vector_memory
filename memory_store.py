@@ -25,7 +25,7 @@ class VectorMemoryStore:
     记忆类型 (visibility):
     - public: 公共记忆，所有用户可见（如主人的家庭成员、基本设定）
     - private: 用户专属记忆，仅该用户可见
-    - secret: 秘密记忆，仅特定用户触发时可见
+    - secret: 秘密记忆，仅特定用户触发时可见（无 allowed_users 时仅 owner 可访问）
     
     分层架构 (layer):
     - L0: 核心层，始终加载（如称呼规则、安全偏好、身份映射）
@@ -103,6 +103,49 @@ class VectorMemoryStore:
         canonical_id = self.get_canonical_user_id(session_id)
         return canonical_id in self.masters
     
+    def _check_visibility_permission(
+        self, 
+        visibility: str, 
+        owner: str, 
+        allowed_users: str, 
+        canonical_user: str,
+        is_master: bool
+    ) -> bool:
+        """检查用户是否有权限访问该记忆
+        
+        Args:
+            visibility: 记忆可见性
+            owner: 记忆所有者
+            allowed_users: 允许访问的用户列表（逗号分隔）
+            canonical_user: 当前用户的规范ID
+            is_master: 是否为主人
+            
+        Returns:
+            是否有权限访问
+        """
+        # 主人可以看到所有记忆
+        if is_master:
+            return True
+        
+        # 公共记忆：所有人可见
+        if visibility == "public":
+            return True
+        
+        # 私有记忆：只有所有者可见
+        if visibility == "private":
+            return owner == canonical_user
+        
+        # 秘密记忆：检查 allowed_users
+        if visibility == "secret":
+            # 如果有 allowed_users，检查用户是否在列表中
+            if allowed_users:
+                return canonical_user in allowed_users.split(",")
+            # 如果没有 allowed_users，只有 owner 可以访问
+            else:
+                return owner == canonical_user
+        
+        return False
+    
     async def warmup_cache(self, get_embedding_func):
         """预热缓存 - 加载 L0 和 L1 层记忆的 embedding
         
@@ -171,6 +214,7 @@ class VectorMemoryStore:
                         "access_count": metadata.get("access_count", 0),
                         "visibility": metadata.get("visibility", "public"),
                         "owner": metadata.get("owner", ""),
+                        "allowed_users": metadata.get("allowed_users", ""),
                         "layer": layer,
                         "keywords": metadata.get("keywords", "").split(",") if metadata.get("keywords") else []
                     })
@@ -417,21 +461,9 @@ class VectorMemoryStore:
                     owner = metadata.get("owner", "")
                     allowed_users = metadata.get("allowed_users", "")
                     
-                    # 主人可以看到所有记忆
-                    if is_master:
-                        pass
-                    # 公共记忆：所有人可见
-                    elif visibility == "public":
-                        pass
-                    # 私有记忆：只有所有者可见
-                    elif visibility == "private":
-                        if owner != canonical_user:
-                            continue
-                    # 秘密记忆：只有允许的用户可见
-                    elif visibility == "secret":
-                        if allowed_users and canonical_user not in allowed_users.split(","):
-                            continue
-                    else:
+                    if not self._check_visibility_permission(
+                        visibility, owner, allowed_users, canonical_user, is_master
+                    ):
                         continue
                     
                     # 类别和重要性过滤
@@ -453,6 +485,7 @@ class VectorMemoryStore:
                         "access_count": metadata.get("access_count", 0),
                         "visibility": visibility,
                         "owner": owner,
+                        "allowed_users": allowed_users,
                         "layer": metadata.get("layer", "L2"),
                         "keywords": metadata.get("keywords", "").split(",") if metadata.get("keywords") else [],
                         "similarity": float(similarity)
@@ -500,17 +533,9 @@ class VectorMemoryStore:
                     owner = metadata.get("owner", "")
                     allowed_users = metadata.get("allowed_users", "")
                     
-                    if is_master:
-                        pass
-                    elif mem_visibility == "public":
-                        pass
-                    elif mem_visibility == "private":
-                        if owner != canonical_user:
-                            continue
-                    elif mem_visibility == "secret":
-                        if allowed_users and canonical_user not in allowed_users.split(","):
-                            continue
-                    else:
+                    if not self._check_visibility_permission(
+                        mem_visibility, owner, allowed_users, canonical_user, is_master
+                    ):
                         continue
                     
                     # 类别过滤
@@ -535,6 +560,7 @@ class VectorMemoryStore:
                         "access_count": metadata.get("access_count", 0),
                         "visibility": mem_visibility,
                         "owner": owner,
+                        "allowed_users": allowed_users,
                         "layer": metadata.get("layer", "L2"),
                         "keywords": metadata.get("keywords", "").split(",") if metadata.get("keywords") else []
                     })
@@ -667,6 +693,69 @@ class VectorMemoryStore:
             
             return await asyncio.get_event_loop().run_in_executor(None, _update)
     
+    async def update_visibility(
+        self, 
+        memory_id: int, 
+        visibility: str, 
+        user_id: str,
+        allowed_users: Optional[list[str]] = None
+    ) -> bool:
+        """更新记忆可见性
+        
+        Args:
+            memory_id: 记忆ID
+            visibility: 新可见性 (public/private/secret)
+            user_id: 当前用户ID
+            allowed_users: 允许访问的用户列表（用于 secret 记忆）
+            
+        Returns:
+            是否更新成功
+        """
+        async with self._lock:
+            def _update():
+                try:
+                    result = self.collection.get(
+                        ids=[str(memory_id)],
+                        include=["documents", "embeddings", "metadatas"]
+                    )
+                    
+                    if not result["ids"]:
+                        return False
+                    
+                    metadata = result["metadatas"][0]
+                    owner = metadata.get("owner", "")
+                    canonical_user = self.get_canonical_user_id(user_id)
+                    
+                    # 权限检查：主人可以修改任何记忆，普通用户只能修改自己的记忆
+                    if not self.is_master(user_id):
+                        if owner != canonical_user:
+                            return False
+                    
+                    # 更新可见性
+                    metadata["visibility"] = visibility
+                    metadata["updated_at"] = datetime.now().isoformat()
+                    
+                    # 更新 allowed_users
+                    if allowed_users:
+                        canonical_allowed = [self.get_canonical_user_id(u) for u in allowed_users]
+                        metadata["allowed_users"] = ",".join(canonical_allowed)
+                    else:
+                        metadata["allowed_users"] = ""
+                    
+                    self.collection.upsert(
+                        ids=[str(memory_id)],
+                        embeddings=[result["embeddings"][0]],
+                        documents=[result["documents"][0]],
+                        metadatas=[metadata]
+                    )
+                    
+                    return True
+                except Exception as e:
+                    logger.error(f"更新记忆可见性失败: {e}")
+                    return False
+            
+            return await asyncio.get_event_loop().run_in_executor(None, _update)
+    
     async def increment_access_count(self, memory_id: int):
         """增加访问计数"""
         async with self._lock:
@@ -716,17 +805,9 @@ class VectorMemoryStore:
                         owner = metadata.get("owner", "")
                         allowed_users = metadata.get("allowed_users", "")
                         
-                        if is_master:
-                            pass
-                        elif visibility == "public":
-                            pass
-                        elif visibility == "private":
-                            if owner != canonical_user:
-                                continue
-                        elif visibility == "secret":
-                            if allowed_users and canonical_user not in allowed_users.split(","):
-                                continue
-                        else:
+                        if not self._check_visibility_permission(
+                            visibility, owner, allowed_users, canonical_user, is_master
+                        ):
                             continue
                         
                         count += 1
